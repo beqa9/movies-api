@@ -1,6 +1,7 @@
 package com.example.movies.services;
 
 import com.example.movies.entities.ApiLog;
+import com.example.movies.exception.*;
 import com.example.movies.models.ImdbResponseModel;
 import com.example.movies.repositories.ApiLogRepository;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -8,6 +9,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -21,14 +23,13 @@ import java.util.stream.Collectors;
 public class ImdbServiceImpl implements ImdbService {
 
     private final ApiLogRepository apiLogRepository;
-    private final ObjectMapper objectMapper = new ObjectMapper();
-
-    private final HttpClient httpClient = HttpClient.newHttpClient();
-
-    private static final String BASE_URL = "https://imdb236.p.rapidapi.com/";
+    private final ObjectMapper objectMapper;
+    private final HttpClient httpClient;
 
     @Value("${rapidapi.key}")
     private String apiKey;
+
+    private static final String BASE_URL = "https://imdb236.p.rapidapi.com/";
 
     @Override
     public ImdbResponseModel callImdbApi(String dynamicPath, Map<String, String> queryParams) {
@@ -37,62 +38,82 @@ public class ImdbServiceImpl implements ImdbService {
         String url = buildUrl(dynamicPath, queryParams);
 
         int status = 500;
-        String responseJson = null;
+        String responseBody = null;
 
         try {
-            HttpRequest req = HttpRequest.newBuilder()
+            HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(url))
                     .header("X-RapidAPI-Key", apiKey)
                     .header("X-RapidAPI-Host", "imdb236.p.rapidapi.com")
-                    .header("accept", "application/json")
+                    .header("Accept", "application/json")
                     .GET()
                     .build();
 
             HttpResponse<String> response =
-                    httpClient.send(req, HttpResponse.BodyHandlers.ofString());
+                    httpClient.send(request, HttpResponse.BodyHandlers.ofString());
 
             status = response.statusCode();
-            responseJson = response.body();
+            responseBody = response.body();
+
+            // Handle API-specific error codes
+            if (status == 429) {
+                throw new RateLimitException("RapidAPI rate limit exceeded");
+            }
+            if (status == 404) {
+                throw new NotFoundException("IMDb resource not found");
+            }
+            if (status >= 500) {
+                throw new ExternalApiException("IMDb server error: " + status);
+            }
+            if (status >= 400) {
+                throw new BadRequestException("Invalid request to IMDb: " + status);
+            }
 
             return ImdbResponseModel.builder()
-                    .json(responseJson)
+                    .json(responseBody)
                     .statusCode(status)
                     .build();
 
-        } catch (Exception e) {
-            responseJson = "{\"error\":\"" + e.getMessage() + "\"}";
-            throw new RuntimeException("IMDb API error: " + e.getMessage());
+        } catch (IOException | InterruptedException ex) {
+            responseBody = ex.getMessage();
+            throw new ServiceUnavailableException("IMDb API unavailable", ex);
         } finally {
-            try {
-                apiLogRepository.save(
-                        ApiLog.builder()
-                                .endpoint(url)
-                                .httpMethod("GET")
-                                .statusCode(status)
-                                .executionTimeMs((int) (System.currentTimeMillis() - start))
-                                .requestParams(queryParams != null
-                                        ? objectMapper.writeValueAsString(queryParams)
-                                        : "{}")
-                                .responseBody(responseJson)
-                                .createdAt(OffsetDateTime.now())
-                                .build()
-                );
-            } catch (Exception loggingError) {
-                loggingError.printStackTrace();
-            }
+            logApiCall(url, queryParams, status, responseBody, start);
+        }
+    }
+
+    private void logApiCall(String url, Map<String, String> params, int status,
+                            String response, long startTime) {
+        try {
+            apiLogRepository.save(
+                    ApiLog.builder()
+                            .endpoint(url)
+                            .httpMethod("GET")
+                            .statusCode(status)
+                            .executionTimeMs((int) (System.currentTimeMillis() - startTime))
+                            .requestParams(
+                                    params != null ? objectMapper.writeValueAsString(params) : "{}"
+                            )
+                            .responseBody(response)
+                            .createdAt(OffsetDateTime.now())
+                            .build()
+            );
+        } catch (Exception e) {
+
+            e.printStackTrace();
         }
     }
 
     private String buildUrl(String dynamicPath, Map<String, String> queryParams) {
-        StringBuilder url = new StringBuilder(BASE_URL).append(dynamicPath);
+        StringBuilder sb = new StringBuilder(BASE_URL).append(dynamicPath);
 
         if (queryParams != null && !queryParams.isEmpty()) {
             String qp = queryParams.entrySet().stream()
                     .map(e -> e.getKey() + "=" + e.getValue())
                     .collect(Collectors.joining("&"));
-
-            url.append("?").append(qp);
+            sb.append("?").append(qp);
         }
-        return url.toString();
+
+        return sb.toString();
     }
 }
